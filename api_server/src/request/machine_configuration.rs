@@ -6,10 +6,10 @@ use std::result;
 use futures::sync::oneshot;
 use hyper::{Method, Response, StatusCode};
 
+use super::{VmmAction, VmmRequest};
 use http_service::json_response;
 use request::{GenerateHyperResponse, IntoParsedRequest, ParsedRequest};
 use vmm::vmm_config::machine_config::VmConfig;
-use vmm::VmmAction;
 
 impl GenerateHyperResponse for VmConfig {
     fn generate_response(&self) -> Response {
@@ -39,7 +39,7 @@ impl IntoParsedRequest for VmConfig {
         let (sender, receiver) = oneshot::channel();
         match method {
             Method::Get => Ok(ParsedRequest::Sync(
-                VmmAction::GetVmConfiguration(sender),
+                VmmRequest::new(VmmAction::GetVmConfiguration, sender),
                 receiver,
             )),
             Method::Patch => {
@@ -51,7 +51,7 @@ impl IntoParsedRequest for VmConfig {
                     return Err(String::from("Empty PATCH request."));
                 }
                 Ok(ParsedRequest::Sync(
-                    VmmAction::SetVmConfiguration(self, sender),
+                    VmmRequest::new(VmmAction::SetVmConfiguration(self), sender),
                     receiver,
                 ))
             }
@@ -63,7 +63,7 @@ impl IntoParsedRequest for VmConfig {
                     return Err(String::from("Missing mandatory fields."));
                 }
                 Ok(ParsedRequest::Sync(
-                    VmmAction::SetVmConfiguration(self, sender),
+                    VmmRequest::new(VmmAction::SetVmConfiguration(self), sender),
                     receiver,
                 ))
             }
@@ -78,10 +78,6 @@ mod tests {
     use vmm::vmm_config::machine_config::CpuFeaturesTemplate;
 
     #[test]
-    #[allow(clippy::assertions_on_constants)]
-    // Allow assertions on constants is necessary because we cannot implement
-    // PartialEq on ParsedRequest due to the use of serde Value which doesn't
-    // implement PartialEq.
     fn test_into_parsed_request() {
         let body = VmConfig {
             vcpu_count: Some(8),
@@ -94,7 +90,7 @@ mod tests {
             .clone()
             .into_parsed_request(None, Method::Put)
             .eq(&Ok(ParsedRequest::Sync(
-                VmmAction::SetVmConfiguration(body, sender),
+                VmmRequest::new(VmmAction::SetVmConfiguration(body), sender),
                 receiver
             ))));
 
@@ -122,9 +118,10 @@ mod tests {
             ht_enabled: None,
             cpu_template: Some(CpuFeaturesTemplate::T2),
         };
-        match body.into_parsed_request(None, Method::Put) {
-            Ok(_) => assert!(false),
-            Err(e) => assert_eq!(e, String::from("Missing mandatory fields.")),
-        };
+        if let Err(e) = body.into_parsed_request(None, Method::Put) {
+            assert_eq!(e, String::from("Missing mandatory fields."));
+        } else {
+            panic!();
+        }
     }
 }

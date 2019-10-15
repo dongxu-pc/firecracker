@@ -62,7 +62,7 @@ class JailerContext:
         """Cleanup this jailer context."""
         self.cleanup()
 
-    def construct_param_list(self, config_file):
+    def construct_param_list(self, config_file, no_api):
         """Create the list of parameters we want the jailer to start with.
 
         We want to be able to vary any parameter even the required ones as we
@@ -97,6 +97,8 @@ class JailerContext:
         if config_file is not None:
             jailer_param_list.extend(['--'])
             jailer_param_list.extend(['--config-file', str(config_file)])
+        if no_api:
+            jailer_param_list.append('--no-api')
         return jailer_param_list
 
     def chroot_base_with_id(self):
@@ -163,6 +165,7 @@ class JailerContext:
 
     def cleanup(self):
         """Clean up this jailer context."""
+        # pylint: disable=subprocess-run-check
         shutil.rmtree(self.chroot_base_with_id(), ignore_errors=True)
 
         if self.netns:
@@ -216,6 +219,7 @@ class JailerContext:
         disappears. The retry function that calls this code makes
         sure we do not timeout.
         """
+        # pylint: disable=subprocess-run-check
         tasks_file = '/sys/fs/cgroup/{}/{}/{}/tasks'.format(
             controller,
             FC_BINARY_NAME,

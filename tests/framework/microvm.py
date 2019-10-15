@@ -46,7 +46,8 @@ class Microvm:
         build_feature='',
         monitor_memory=True,
         bin_cloner_path=None,
-        config_file=None
+        config_file=None,
+        no_api=False,
     ):
         """Set up microVM attributes, paths, and data structures."""
         # Unique identifier for this machine.
@@ -100,6 +101,9 @@ class Microvm:
         # command line parameter.
         self.config_file = config_file
 
+        # Parameter set when user wants to disable API thread.
+        self.no_api = no_api
+
         # The ssh config dictionary is populated with information about how
         # to connect to a microVM that has ssh capability. The path of the
         # private key is populated by microvms with ssh capabilities and the
@@ -120,6 +124,7 @@ class Microvm:
 
     def kill(self):
         """All clean up associated with this microVM should go here."""
+        # pylint: disable=subprocess-run-check
         if self._jailer.daemonize:
             if self.jailer_clone_pid:
                 run('kill -9 {}'.format(self.jailer_clone_pid), shell=True)
@@ -249,6 +254,7 @@ class Microvm:
 
     def spawn(self):
         """Start a microVM as a daemon or in a screen session."""
+        # pylint: disable=subprocess-run-check
         self._jailer.setup()
         self._api_socket = self._jailer.api_socket_path()
         self._api_session = Session()
@@ -265,7 +271,8 @@ class Microvm:
         self.network = Network(self._api_socket, self._api_session)
         self.vsock = Vsock(self._api_socket, self._api_session)
 
-        jailer_param_list = self._jailer.construct_param_list(self.config_file)
+        jailer_param_list = self._jailer.construct_param_list(self.config_file,
+                                                              self.no_api)
 
         # When the daemonize flag is on, we want to clone-exec into the
         # jailer rather than executing it via spawning a shell. Going
@@ -340,7 +347,8 @@ class Microvm:
         # We expect the jailer to start within 80 ms. However, we wait for
         # 1 sec since we are rechecking the existence of the socket 5 times
         # and leave 0.2 delay between them.
-        self._wait_create()
+        if not self.no_api:
+            self._wait_create()
 
     @retry(delay=0.2, tries=5)
     def _wait_create(self):

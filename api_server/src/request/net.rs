@@ -6,9 +6,9 @@ use std::result;
 use futures::sync::oneshot;
 use hyper::Method;
 
+use super::{VmmAction, VmmRequest};
 use request::{IntoParsedRequest, ParsedRequest};
 use vmm::vmm_config::net::{NetworkInterfaceConfig, NetworkInterfaceUpdateConfig};
-use vmm::VmmAction;
 
 impl IntoParsedRequest for NetworkInterfaceConfig {
     fn into_parsed_request(
@@ -25,7 +25,7 @@ impl IntoParsedRequest for NetworkInterfaceConfig {
 
         let (sender, receiver) = oneshot::channel();
         Ok(ParsedRequest::Sync(
-            VmmAction::InsertNetworkDevice(self, sender),
+            VmmRequest::new(VmmAction::InsertNetworkDevice(self), sender),
             receiver,
         ))
     }
@@ -46,7 +46,7 @@ impl IntoParsedRequest for NetworkInterfaceUpdateConfig {
 
         let (sender, receiver) = oneshot::channel();
         Ok(ParsedRequest::Sync(
-            VmmAction::UpdateNetworkInterface(self, sender),
+            VmmRequest::new(VmmAction::UpdateNetworkInterface(self), sender),
             receiver,
         ))
     }
@@ -76,7 +76,6 @@ mod tests {
             rx_rate_limiter: None,
             tx_rate_limiter: None,
             allow_mmds_requests: false,
-            tap: None,
         }
     }
 
@@ -106,7 +105,7 @@ mod tests {
         assert!(netif
             .into_parsed_request(Some(String::from("foo")), Method::Put)
             .eq(&Ok(ParsedRequest::Sync(
-                VmmAction::InsertNetworkDevice(netif_clone, sender),
+                VmmRequest::new(VmmAction::InsertNetworkDevice(netif_clone), sender),
                 receiver
             ))));
     }
@@ -120,7 +119,6 @@ mod tests {
             rx_rate_limiter: Some(RateLimiterConfig::default()),
             tx_rate_limiter: Some(RateLimiterConfig::default()),
             allow_mmds_requests: true,
-            tap: None,
         };
 
         // This is the json encoding of the netif variable.

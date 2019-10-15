@@ -43,7 +43,6 @@ pub mod signal_handler;
 pub mod vmm_config;
 mod vstate;
 
-use futures::sync::oneshot;
 use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
 use std::fs::{metadata, File, OpenOptions};
@@ -52,7 +51,7 @@ use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::PathBuf;
 use std::process;
 use std::result;
-use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
+use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Barrier, Mutex, RwLock};
 use std::thread;
 use std::time::Duration;
@@ -75,7 +74,7 @@ use devices::virtio::{BLOCK_EVENTS_COUNT, TYPE_BLOCK};
 use devices::virtio::{NET_EVENTS_COUNT, TYPE_NET};
 use devices::RawIOHandler;
 use devices::{DeviceEventT, EpollHandler};
-use fc_util::{get_time, ClockType};
+use fc_util::time::{get_time, ClockType};
 use kernel::cmdline as kernel_cmdline;
 use kernel::loader as kernel_loader;
 use logger::error::LoggerError;
@@ -91,7 +90,7 @@ use vmm_config::boot_source::{BootSourceConfig, BootSourceConfigError};
 use vmm_config::device_config::DeviceConfigs;
 use vmm_config::drive::{BlockDeviceConfig, BlockDeviceConfigs, DriveError};
 use vmm_config::instance_info::{InstanceInfo, InstanceState, StartMicrovmError};
-use vmm_config::logger::{LoggerConfig, LoggerConfigError, LoggerLevel};
+use vmm_config::logger::{LoggerConfig, LoggerConfigError, LoggerLevel, LoggerWriter};
 use vmm_config::machine_config::{VmConfig, VmConfigError};
 use vmm_config::net::{
     NetworkInterfaceConfig, NetworkInterfaceConfigs, NetworkInterfaceError,
@@ -135,8 +134,6 @@ pub const FC_EXIT_CODE_BAD_CONFIGURATION: u8 = 152;
 /// input, but can result from bad configuration of the host (for example if Firecracker doesn't
 /// have permissions to open the KVM fd).
 pub enum Error {
-    /// Cannot receive message from the API.
-    ApiChannel,
     /// Legacy devices work with Event file descriptors and the creation can fail because
     /// of resource exhaustion.
     CreateLegacyDevice(device_manager::legacy::Error),
@@ -171,7 +168,6 @@ impl std::fmt::Debug for Error {
         use self::Error::*;
 
         match self {
-            ApiChannel => write!(f, "ApiChannel: error receiving data from the API server"),
             CreateLegacyDevice(e) => write!(f, "Error creating legacy device: {:?}", e),
             EpollFd(e) => write!(f, "Epoll fd error: {}", e.to_string()),
             EventFd(e) => write!(f, "Event fd error: {}", e.to_string()),
@@ -296,7 +292,7 @@ impl std::convert::From<NetworkInterfaceError> for VmmActionError {
                 // User errors.
                 OpenTun(_) | CreateTap(_) | InvalidIfname => ErrorKind::User,
                 // Internal errors.
-                IoctlError(_) | NetUtil(_) => ErrorKind::Internal,
+                IoctlError(_) | CreateSocket(_) => ErrorKind::Internal,
             },
         };
 
@@ -311,9 +307,9 @@ impl std::convert::From<StartMicrovmError> for VmmActionError {
 
         let kind = match e {
             // User errors.
-            CreateBlockDevice(_)
+            CreateVsockBackend(_)
+            | CreateBlockDevice(_)
             | CreateNetDevice(_)
-            | CreateVsockDevice
             | KernelCmdline(_)
             | KernelLoader(_)
             | MicroVMAlreadyRunning
@@ -325,6 +321,7 @@ impl std::convert::From<StartMicrovmError> for VmmActionError {
             ConfigureSystem(_)
             | ConfigureVm(_)
             | CreateRateLimiter(_)
+            | CreateVsockDevice(_)
             | DeviceManager
             | EventFd
             | GuestMemory(_)
@@ -372,7 +369,7 @@ impl Display for VmmActionError {
         use self::VmmActionError::*;
 
         let error = match *self {
-            BootSource(_, ref err) => err as &ToString,
+            BootSource(_, ref err) => err as &dyn ToString,
             DriveConfig(_, ref err) => err,
             Logger(_, ref err) => err,
             MachineConfig(_, ref err) => err,
@@ -386,74 +383,8 @@ impl Display for VmmActionError {
     }
 }
 
-/// This enum represents the public interface of the VMM. Each action contains various
-/// bits of information (ids, paths, etc.), together with an OutcomeSender, which is always present.
-#[derive(Debug)]
-#[allow(clippy::large_enum_variant)]
-pub enum VmmAction {
-    /// Configure the boot source of the microVM using as input the `ConfigureBootSource`. This
-    /// action can only be called before the microVM has booted. The response is sent using the
-    /// `OutcomeSender`.
-    ConfigureBootSource(BootSourceConfig, OutcomeSender),
-    /// Configure the logger using as input the `LoggerConfig`. This action can only be called
-    /// before the microVM has booted. The response is sent using the `OutcomeSender`.
-    ConfigureLogger(LoggerConfig, OutcomeSender),
-    /// Get the configuration of the microVM. The action response is sent using the `OutcomeSender`.
-    GetVmConfiguration(OutcomeSender),
-    /// Flush the metrics. This action can only be called after the logger has been configured.
-    /// The response is sent using the `OutcomeSender`.
-    FlushMetrics(OutcomeSender),
-    /// Add a new block device or update one that already exists using the `BlockDeviceConfig` as
-    /// input. This action can only be called before the microVM has booted. The response
-    /// is sent using the `OutcomeSender`.
-    InsertBlockDevice(BlockDeviceConfig, OutcomeSender),
-    /// Add a new network interface config or update one that already exists using the
-    /// `NetworkInterfaceConfig` as input. This action can only be called before the microVM has
-    /// booted. The response is sent using the `OutcomeSender`.
-    InsertNetworkDevice(NetworkInterfaceConfig, OutcomeSender),
-    /// Set the vsock device or update the one that already exists using the
-    /// `VsockDeviceConfig` as input. This action can only be called before the microVM has
-    /// booted. The response is sent using the `OutcomeSender`.
-    SetVsockDevice(VsockDeviceConfig, OutcomeSender),
-    /// Update the size of an existing block device specified by an ID. The ID is the first data
-    /// associated with this enum variant. This action can only be called after the microVM is
-    /// started. The response is sent using the `OutcomeSender`.
-    RescanBlockDevice(String, OutcomeSender),
-    /// Set the microVM configuration (memory & vcpu) using `VmConfig` as input. This
-    /// action can only be called before the microVM has booted. The action
-    /// response is sent using the `OutcomeSender`.
-    SetVmConfiguration(VmConfig, OutcomeSender),
-    /// Launch the microVM. This action can only be called before the microVM has booted.
-    /// The response is sent using the `OutcomeSender`.
-    StartMicroVm(OutcomeSender),
-    /// Send CTRL+ALT+DEL to the microVM, using the i8042 keyboard function. If an AT-keyboard
-    /// driver is listening on the guest end, this can be used to shut down the microVM gracefully.
-    SendCtrlAltDel(OutcomeSender),
-    /// Update the path of an existing block device. The data associated with this variant
-    /// represents the `drive_id` and the `path_on_host`. The response is sent using
-    /// the `OutcomeSender`.
-    UpdateBlockDevicePath(String, String, OutcomeSender),
-    /// Update a network interface, after microVM start. Currently, the only updatable properties
-    /// are the RX and TX rate limiters.
-    UpdateNetworkInterface(NetworkInterfaceUpdateConfig, OutcomeSender),
-}
-
-/// The enum represents the response sent by the VMM in case of success. The response is either
-/// empty, when no data needs to be sent, or an internal VMM structure.
-#[derive(Debug)]
-pub enum VmmData {
-    /// No data is sent on the channel.
-    Empty,
-    /// The microVM configuration represented by `VmConfig`.
-    MachineConfiguration(VmConfig),
-}
-
-/// Data type used to communicate between the API and the VMM.
-pub type VmmRequestOutcome = std::result::Result<VmmData, VmmActionError>;
-/// One shot channel used to send a request.
-pub type OutcomeSender = oneshot::Sender<VmmRequestOutcome>;
-/// One shot channel used to receive a response.
-pub type OutcomeReceiver = oneshot::Receiver<VmmRequestOutcome>;
+/// Shorthand result type for external VMM commands.
+pub type UserResult = std::result::Result<(), VmmActionError>;
 
 type Result<T> = std::result::Result<T, Error>;
 
@@ -510,7 +441,7 @@ impl KvmContext {
         // Check that all desired capabilities aer supported.
         for capability in capabilities.iter() {
             if !kvm.check_extension(*capability) {
-                Err(Error::KvmCap(*capability))?;
+                return Err(Error::KvmCap(*capability));
             }
         }
 
@@ -538,12 +469,12 @@ enum EpollDispatch {
 }
 
 struct MaybeHandler {
-    handler: Option<Box<EpollHandler>>,
-    receiver: Receiver<Box<EpollHandler>>,
+    handler: Option<Box<dyn EpollHandler>>,
+    receiver: Receiver<Box<dyn EpollHandler>>,
 }
 
 impl MaybeHandler {
-    fn new(receiver: Receiver<Box<EpollHandler>>) -> Self {
+    fn new(receiver: Receiver<Box<dyn EpollHandler>>) -> Self {
         MaybeHandler {
             handler: None,
             receiver,
@@ -609,7 +540,7 @@ impl EpollContext {
             // Find a better solution to this (and think about the state of the serial device
             // while we're at it). This also led to commenting out parts of the
             // enable_disable_stdin_test() unit test function.
-            warn!("Could not add stdin event to epoll. {:?}", e);
+            warn!("Could not add stdin event to epoll. {}", e);
         } else {
             self.dispatch_table[self.stdin_index as usize] = Some(EpollDispatch::Stdin);
         }
@@ -656,7 +587,7 @@ impl EpollContext {
     /// This device's handler will be added to the end of `device_handlers`.
     /// This returns the index of the first token, and a channel on which to
     /// send an epoll handler for the relevant device.
-    fn allocate_tokens_for_device(&mut self, count: usize) -> (u64, Sender<Box<EpollHandler>>) {
+    fn allocate_tokens_for_device(&mut self, count: usize) -> (u64, Sender<Box<dyn EpollHandler>>) {
         let dispatch_base = self.dispatch_table.len() as u64;
         let device_idx = self.device_handlers.len();
         let (sender, receiver) = channel();
@@ -692,7 +623,7 @@ impl EpollContext {
         T::new(dispatch_base, self.epoll_raw_fd, sender)
     }
 
-    fn get_device_handler_by_handler_id(&mut self, id: usize) -> Result<&mut EpollHandler> {
+    fn get_device_handler_by_handler_id(&mut self, id: usize) -> Result<&mut dyn EpollHandler> {
         let maybe = &mut self.device_handlers[id];
         match maybe.handler {
             Some(ref mut v) => Ok(v.as_mut()),
@@ -805,9 +736,6 @@ pub struct Vmm {
 
     epoll_context: EpollContext,
 
-    // API resources.
-    from_api: Receiver<Box<VmmAction>>,
-
     write_metrics_event_fd: TimerFd,
 
     // The level of seccomp filtering used. Seccomp filters are loaded before executing guest code.
@@ -817,17 +745,16 @@ pub struct Vmm {
 impl Vmm {
     /// Creates a new VMM object.
     pub fn new(
-        api_shared_info: Arc<RwLock<InstanceInfo>>,
-        control_fd: &AsRawFd,
-        from_api: Receiver<Box<VmmAction>>,
+        shared_info: Arc<RwLock<InstanceInfo>>,
+        control_fd: &dyn AsRawFd,
         seccomp_level: u32,
-        kvm: Kvm,
     ) -> Result<Self> {
+        let kvm = Kvm::new().expect("Error creating the Kvm object");
         let mut epoll_context = EpollContext::new()?;
         // If this fails, it's fatal; using expect() to crash.
         epoll_context
             .add_event(control_fd, EpollDispatch::VmmActionRequest)
-            .expect("Cannot add API control_fd to epoll.");
+            .expect("Cannot add vmm control_fd to epoll.");
 
         let write_metrics_event_fd =
             TimerFd::new_custom(ClockId::Monotonic, true, true).map_err(Error::TimerFd)?;
@@ -851,7 +778,7 @@ impl Vmm {
         Ok(Vmm {
             kvm,
             vm_config: VmConfig::default(),
-            shared_info: api_shared_info,
+            shared_info,
             stdin_handle: io::stdin(),
             guest_memory: None,
             kernel_config: None,
@@ -862,10 +789,14 @@ impl Vmm {
             pio_device_manager: PortIODeviceManager::new().map_err(Error::CreateLegacyDevice)?,
             device_configs,
             epoll_context,
-            from_api,
             write_metrics_event_fd,
             seccomp_level,
         })
+    }
+
+    /// Returns the VmConfig of this Vmm.
+    pub fn vm_config(&self) -> &VmConfig {
+        &self.vm_config
     }
 
     fn update_drive_handler(
@@ -1000,8 +931,8 @@ impl Vmm {
                 .map_err(CreateRateLimiter)?;
 
             let vm_fd = self.vm.get_fd();
-            cfg.take_tap()
-                .ok_or(NetDeviceNotConfigured)
+            cfg.open_tap()
+                .map_err(|_| NetDeviceNotConfigured)
                 .and_then(|tap| {
                     let net_box = Box::new(
                         devices::virtio::Net::new_with_tap(
@@ -1044,7 +975,7 @@ impl Vmm {
                 u64::from(cfg.guest_cid),
                 cfg.uds_path.clone(),
             )
-            .map_err(|_| StartMicrovmError::CreateVsockDevice)?;
+            .map_err(StartMicrovmError::CreateVsockBackend)?;
 
             let epoll_config = self.epoll_context.allocate_tokens_for_virtio_device(
                 TYPE_VSOCK,
@@ -1053,7 +984,7 @@ impl Vmm {
             );
             let vsock_box = Box::new(
                 devices::virtio::Vsock::new(u64::from(cfg.guest_cid), epoll_config, backend)
-                    .or(Err(StartMicrovmError::CreateVsockDevice))?,
+                    .map_err(StartMicrovmError::CreateVsockDevice)?,
             );
             device_manager
                 .register_virtio_device(
@@ -1073,8 +1004,9 @@ impl Vmm {
         self.kernel_config = Some(kernel_config);
     }
 
-    fn flush_metrics(&mut self) -> std::result::Result<VmmData, VmmActionError> {
-        self.write_metrics().map(|_| VmmData::Empty).map_err(|e| {
+    /// Force writes metrics.
+    pub fn flush_metrics(&mut self) -> UserResult {
+        self.write_metrics().map_err(|e| {
             let (kind, error_contents) = match e {
                 LoggerError::NeverInitialized(s) => (ErrorKind::User, s),
                 _ => (ErrorKind::Internal, e.to_string()),
@@ -1095,7 +1027,7 @@ impl Vmm {
         // The dirty pages are only available on x86_64.
         #[cfg(target_arch = "x86_64")]
         self.log_dirty_pages();
-        LOGGER.log_metrics()
+        LOGGER.log_metrics().map(|_| ())
     }
 
     fn init_guest_memory(&mut self) -> std::result::Result<(), StartMicrovmError> {
@@ -1167,7 +1099,7 @@ impl Vmm {
     }
 
     #[cfg(target_arch = "x86_64")]
-    fn get_serial_device(&self) -> Option<Arc<Mutex<RawIOHandler>>> {
+    fn get_serial_device(&self) -> Option<Arc<Mutex<dyn RawIOHandler>>> {
         Some(self.pio_device_manager.stdio_serial.clone())
     }
 
@@ -1461,10 +1393,10 @@ impl Vmm {
     }
 
     /// Set up the initial microVM state and start the vCPU threads.
-    pub fn start_microvm(&mut self) -> std::result::Result<VmmData, VmmActionError> {
+    pub fn start_microvm(&mut self) -> UserResult {
         info!("VMM received instance start command");
         if self.is_instance_initialized() {
-            Err(StartMicrovmError::MicroVMAlreadyRunning)?;
+            return Err(StartMicrovmError::MicroVMAlreadyRunning.into());
         }
 
         let request_ts = TimestampUs {
@@ -1531,21 +1463,21 @@ impl Vmm {
             METRICS.logger.missed_metrics_count.inc();
         }
 
-        Ok(VmmData::Empty)
+        Ok(())
     }
 
-    fn send_ctrl_alt_del(&mut self) -> std::result::Result<VmmData, VmmActionError> {
+    /// Injects CTRL+ALT+DEL keystroke combo in the i8042 device.
+    pub fn send_ctrl_alt_del(&mut self) -> UserResult {
         self.pio_device_manager
             .i8042
             .lock()
             .expect("i8042 lock was poisoned")
             .trigger_ctrl_alt_del()
-            .map_err(|e| VmmActionError::SendCtrlAltDel(ErrorKind::Internal, e))?;
-        Ok(VmmData::Empty)
+            .map_err(|e| VmmActionError::SendCtrlAltDel(ErrorKind::Internal, e))
     }
 
     /// Waits for all vCPUs to exit and terminates the Firecracker process.
-    fn stop(&mut self, exit_code: i32) {
+    pub fn stop(&mut self, exit_code: i32) {
         info!("Vmm is stopping.");
 
         if let Err(e) = self.stdin_handle.lock().set_canon_mode() {
@@ -1588,7 +1520,7 @@ impl Vmm {
 
     /// Wait on VMM events and dispatch them to the appropriate handler. Returns to the caller
     /// when a control action occurs.
-    fn run_event_loop(&mut self) -> Result<EventLoopExitReason> {
+    pub fn run_event_loop(&mut self) -> Result<EventLoopExitReason> {
         // TODO: try handling of errors/failures without breaking this main loop.
         loop {
             let event = self.epoll_context.get_event()?;
@@ -1690,7 +1622,7 @@ impl Vmm {
         &mut self,
         kernel_image_path: String,
         kernel_cmdline: Option<String>,
-    ) -> std::result::Result<VmmData, VmmActionError> {
+    ) -> UserResult {
         use BootSourceConfigError::{
             InvalidKernelCommandLine, InvalidKernelPath, UpdateNotAllowedPostBoot,
         };
@@ -1698,7 +1630,7 @@ impl Vmm {
         use VmmActionError::BootSource;
 
         if self.is_instance_initialized() {
-            Err(BootSource(User, UpdateNotAllowedPostBoot))?;
+            return Err(BootSource(User, UpdateNotAllowedPostBoot));
         }
 
         let kernel_file =
@@ -1717,24 +1649,21 @@ impl Vmm {
         };
         self.configure_kernel(kernel_config);
 
-        Ok(VmmData::Empty)
+        Ok(())
     }
 
     /// Set the machine configuration of the microVM.
-    pub fn set_vm_configuration(
-        &mut self,
-        machine_config: VmConfig,
-    ) -> std::result::Result<VmmData, VmmActionError> {
+    pub fn set_vm_configuration(&mut self, machine_config: VmConfig) -> UserResult {
         if self.is_instance_initialized() {
-            Err(VmConfigError::UpdateNotAllowedPostBoot)?;
+            return Err(VmConfigError::UpdateNotAllowedPostBoot.into());
         }
 
         if machine_config.vcpu_count == Some(0) {
-            Err(VmConfigError::InvalidVcpuCount)?;
+            return Err(VmConfigError::InvalidVcpuCount.into());
         }
 
         if machine_config.mem_size_mib == Some(0) {
-            Err(VmConfigError::InvalidMemorySize)?;
+            return Err(VmConfigError::InvalidMemorySize.into());
         }
 
         let ht_enabled = machine_config
@@ -1748,7 +1677,7 @@ impl Vmm {
         // If hyperthreading is enabled or is to be enabled in this call
         // only allow vcpu count to be 1 or even.
         if ht_enabled && vcpu_count_value > 1 && vcpu_count_value % 2 == 1 {
-            Err(VmConfigError::InvalidVcpuCount)?;
+            return Err(VmConfigError::InvalidVcpuCount.into());
         }
 
         // Update all the fields that have a new value.
@@ -1763,28 +1692,22 @@ impl Vmm {
             self.vm_config.cpu_template = machine_config.cpu_template;
         }
 
-        Ok(VmmData::Empty)
+        Ok(())
     }
 
     /// Inserts a network device to be attached when the VM starts.
-    pub fn insert_net_device(
-        &mut self,
-        body: NetworkInterfaceConfig,
-    ) -> std::result::Result<VmmData, VmmActionError> {
+    pub fn insert_net_device(&mut self, body: NetworkInterfaceConfig) -> UserResult {
         if self.is_instance_initialized() {
-            Err(NetworkInterfaceError::UpdateNotAllowedPostBoot)?;
+            return Err(NetworkInterfaceError::UpdateNotAllowedPostBoot.into());
         }
         self.device_configs
             .network_interface
             .insert(body)
-            .map(|_| VmmData::Empty)
             .map_err(|e| VmmActionError::NetworkConfig(ErrorKind::User, e))
     }
 
-    fn update_net_device(
-        &mut self,
-        new_cfg: NetworkInterfaceUpdateConfig,
-    ) -> std::result::Result<VmmData, VmmActionError> {
+    /// Updates configuration for an emulated net device as described in `new_cfg`.
+    pub fn update_net_device(&mut self, new_cfg: NetworkInterfaceUpdateConfig) -> UserResult {
         if !self.is_instance_initialized() {
             // VM not started yet, so we only need to update the device configs, not the actual
             // live device.
@@ -1842,14 +1765,11 @@ impl Vmm {
             );
         }
 
-        Ok(VmmData::Empty)
+        Ok(())
     }
 
     /// Sets a vsock device to be attached when the VM starts.
-    pub fn set_vsock_device(
-        &mut self,
-        config: VsockDeviceConfig,
-    ) -> std::result::Result<VmmData, VmmActionError> {
+    pub fn set_vsock_device(&mut self, config: VsockDeviceConfig) -> UserResult {
         if self.is_instance_initialized() {
             Err(VmmActionError::VsockConfig(
                 ErrorKind::User,
@@ -1857,15 +1777,12 @@ impl Vmm {
             ))
         } else {
             self.device_configs.vsock = Some(config);
-            Ok(VmmData::Empty)
+            Ok(())
         }
     }
 
-    fn set_block_device_path(
-        &mut self,
-        drive_id: String,
-        path_on_host: String,
-    ) -> std::result::Result<VmmData, VmmActionError> {
+    /// Updates the path of the host file backing the emulated block device with id `drive_id`.
+    pub fn set_block_device_path(&mut self, drive_id: String, path_on_host: String) -> UserResult {
         // Get the block device configuration specified by drive_id.
         let block_device_index = self
             .device_configs
@@ -1890,16 +1807,14 @@ impl Vmm {
             self.update_drive_handler(&drive_id, disk_file)?;
             self.rescan_block_device(&drive_id)?;
         }
-        Ok(VmmData::Empty)
+        Ok(())
     }
 
-    fn rescan_block_device(
-        &mut self,
-        drive_id: &str,
-    ) -> std::result::Result<VmmData, VmmActionError> {
+    /// Triggers a rescan of the host file backing the emulated block device with id `drive_id`.
+    pub fn rescan_block_device(&mut self, drive_id: &str) -> UserResult {
         // Rescan can only happen after the guest is booted.
         if !self.is_instance_initialized() {
-            Err(DriveError::OperationNotAllowedPreBoot)?;
+            return Err(DriveError::OperationNotAllowedPreBoot.into());
         }
 
         // Safe to unwrap() because mmio_device_manager is initialized in init_devices(), which is
@@ -1920,7 +1835,6 @@ impl Vmm {
                 }
                 return device_manager
                     .update_drive(drive_id, new_size)
-                    .map(|_| VmmData::Empty)
                     .map_err(|_| VmmActionError::from(DriveError::BlockDeviceUpdateFailed));
             }
         }
@@ -1928,26 +1842,20 @@ impl Vmm {
     }
 
     /// Inserts a block to be attached when the VM starts.
-    // Only call this function as part of the API.
+    // Only call this function as part of user configuration.
     // If the drive_id does not exist, a new Block Device Config is added to the list.
-    pub fn insert_block_device(
-        &mut self,
-        block_device_config: BlockDeviceConfig,
-    ) -> std::result::Result<VmmData, VmmActionError> {
+    pub fn insert_block_device(&mut self, block_device_config: BlockDeviceConfig) -> UserResult {
         if self.is_instance_initialized() {
-            Err(DriveError::UpdateNotAllowedPostBoot)?;
+            return Err(DriveError::UpdateNotAllowedPostBoot.into());
         }
         self.device_configs
             .block
             .insert(block_device_config)
-            .map(|_| VmmData::Empty)
             .map_err(VmmActionError::from)
     }
 
-    fn init_logger(
-        &self,
-        api_logger: LoggerConfig,
-    ) -> std::result::Result<VmmData, VmmActionError> {
+    /// Configures the logger as described in `logger_cfg`.
+    pub fn init_logger(&self, logger_cfg: LoggerConfig) -> UserResult {
         if self.is_instance_initialized() {
             return Err(VmmActionError::Logger(
                 ErrorKind::User,
@@ -1957,118 +1865,58 @@ impl Vmm {
             ));
         }
 
-        let instance_id;
         let firecracker_version;
         {
             let guard = self.shared_info.read().unwrap();
-            instance_id = guard.id.clone();
+            LOGGER.set_instance_id(guard.id.clone());
             firecracker_version = guard.vmm_version.clone();
         }
 
-        LOGGER.set_level(match api_logger.level {
+        LOGGER.set_level(match logger_cfg.level {
             LoggerLevel::Error => Level::Error,
             LoggerLevel::Warning => Level::Warn,
             LoggerLevel::Info => Level::Info,
             LoggerLevel::Debug => Level::Debug,
         });
 
-        LOGGER.set_include_origin(api_logger.show_log_origin, api_logger.show_log_origin);
-        LOGGER.set_include_level(api_logger.show_level);
+        LOGGER.set_include_origin(logger_cfg.show_log_origin, logger_cfg.show_log_origin);
+        LOGGER.set_include_level(logger_cfg.show_level);
 
         #[cfg(target_arch = "aarch64")]
         let options: &Vec<Value> = &vec![];
 
         #[cfg(target_arch = "x86_64")]
-        let options = api_logger.options.as_array().unwrap();
+        let options = logger_cfg.options.as_array().unwrap();
+
+        LOGGER.set_flags(options).map_err(|e| {
+            VmmActionError::Logger(
+                ErrorKind::User,
+                LoggerConfigError::InitializationFailure(e.to_string()),
+            )
+        })?;
 
         LOGGER
             .init(
                 &AppInfo::new("Firecracker", &firecracker_version),
-                &instance_id,
-                api_logger.log_fifo,
-                api_logger.metrics_fifo,
-                options,
+                Box::new(LoggerWriter::new(&logger_cfg.log_fifo).map_err(|e| {
+                    VmmActionError::Logger(
+                        ErrorKind::User,
+                        LoggerConfigError::InitializationFailure(e.to_string()),
+                    )
+                })?),
+                Box::new(LoggerWriter::new(&logger_cfg.metrics_fifo).map_err(|e| {
+                    VmmActionError::Logger(
+                        ErrorKind::User,
+                        LoggerConfigError::InitializationFailure(e.to_string()),
+                    )
+                })?),
             )
-            .map(|_| VmmData::Empty)
             .map_err(|e| {
                 VmmActionError::Logger(
                     ErrorKind::User,
                     LoggerConfigError::InitializationFailure(e.to_string()),
                 )
             })
-    }
-
-    fn send_response(outcome: VmmRequestOutcome, sender: OutcomeSender) {
-        sender
-            .send(outcome)
-            .map_err(|_| ())
-            .expect("one-shot channel closed");
-    }
-
-    fn run_vmm_action(&mut self) -> Result<()> {
-        use VmmAction::*;
-
-        let request = match self.from_api.try_recv() {
-            Ok(t) => *t,
-            Err(TryRecvError::Empty) => {
-                return Err(Error::ApiChannel)?;
-            }
-            Err(TryRecvError::Disconnected) => {
-                panic!("The channel's sending half was disconnected. Cannot receive data.");
-            }
-        };
-
-        match request {
-            ConfigureBootSource(boot_source_body, sender) => {
-                Vmm::send_response(
-                    self.configure_boot_source(
-                        boot_source_body.kernel_image_path,
-                        boot_source_body.boot_args,
-                    ),
-                    sender,
-                );
-            }
-            ConfigureLogger(logger_description, sender) => {
-                Vmm::send_response(self.init_logger(logger_description), sender);
-            }
-            FlushMetrics(sender) => {
-                Vmm::send_response(self.flush_metrics(), sender);
-            }
-            GetVmConfiguration(sender) => {
-                Vmm::send_response(
-                    Ok(VmmData::MachineConfiguration(self.vm_config.clone())),
-                    sender,
-                );
-            }
-            InsertBlockDevice(block_device_config, sender) => {
-                Vmm::send_response(self.insert_block_device(block_device_config), sender);
-            }
-            InsertNetworkDevice(netif_body, sender) => {
-                Vmm::send_response(self.insert_net_device(netif_body), sender);
-            }
-            SetVsockDevice(vsock_cfg, sender) => {
-                Vmm::send_response(self.set_vsock_device(vsock_cfg), sender);
-            }
-            RescanBlockDevice(drive_id, sender) => {
-                Vmm::send_response(self.rescan_block_device(&drive_id), sender);
-            }
-            StartMicroVm(sender) => {
-                Vmm::send_response(self.start_microvm(), sender);
-            }
-            SendCtrlAltDel(sender) => {
-                Vmm::send_response(self.send_ctrl_alt_del(), sender);
-            }
-            SetVmConfiguration(machine_config_body, sender) => {
-                Vmm::send_response(self.set_vm_configuration(machine_config_body), sender);
-            }
-            UpdateBlockDevicePath(drive_id, path_on_host, sender) => {
-                Vmm::send_response(self.set_block_device_path(drive_id, path_on_host), sender);
-            }
-            UpdateNetworkInterface(netif_update, sender) => {
-                Vmm::send_response(self.update_net_device(netif_update), sender);
-            }
-        };
-        Ok(())
     }
 
     fn log_boot_time(t0_ts: &TimestampUs) {
@@ -2086,7 +1934,8 @@ impl Vmm {
         );
     }
 
-    fn configure_from_json(
+    /// Configures Vmm resources as described by the `config_json` param.
+    pub fn configure_from_json(
         &mut self,
         config_json: String,
     ) -> std::result::Result<(), VmmActionError> {
@@ -2124,139 +1973,18 @@ impl Vmm {
     }
 }
 
-// Can't derive PartialEq directly because the sender members can't be compared.
-// This implementation is only used in tests, but cannot be moved to mod tests,
-// because it is used in tests outside of the vmm crate (api_server).
-impl PartialEq for VmmAction {
-    fn eq(&self, other: &VmmAction) -> bool {
-        use VmmAction::*;
-        match (self, other) {
-            (
-                &UpdateBlockDevicePath(ref drive_id, ref path_on_host, _),
-                &UpdateBlockDevicePath(ref other_drive_id, ref other_path_on_host, _),
-            ) => drive_id == other_drive_id && path_on_host == other_path_on_host,
-            (
-                &ConfigureBootSource(ref boot_source, _),
-                &ConfigureBootSource(ref other_boot_source, _),
-            ) => boot_source == other_boot_source,
-            (
-                &InsertBlockDevice(ref block_device, _),
-                &InsertBlockDevice(ref other_other_block_device, _),
-            ) => block_device == other_other_block_device,
-            (&ConfigureLogger(ref log, _), &ConfigureLogger(ref other_log, _)) => log == other_log,
-            (
-                &SetVmConfiguration(ref vm_config, _),
-                &SetVmConfiguration(ref other_vm_config, _),
-            ) => vm_config == other_vm_config,
-            (&InsertNetworkDevice(ref net_dev, _), &InsertNetworkDevice(ref other_net_dev, _)) => {
-                net_dev == other_net_dev
-            }
-            (
-                &UpdateNetworkInterface(ref net_dev, _),
-                &UpdateNetworkInterface(ref other_net_dev, _),
-            ) => net_dev == other_net_dev,
-            (&RescanBlockDevice(ref req, _), &RescanBlockDevice(ref other_req, _)) => {
-                req == other_req
-            }
-            (&StartMicroVm(_), &StartMicroVm(_)) => true,
-            (&SendCtrlAltDel(_), &SendCtrlAltDel(_)) => true,
-            (&FlushMetrics(_), &FlushMetrics(_)) => true,
-            _ => false,
-        }
-    }
-}
-
-/// Starts a new vmm thread that can service API requests.
-///
-/// # Arguments
-///
-/// * `api_shared_info` - A parameter for storing information on the VMM (e.g the current state).
-/// * `api_event_fd` - An event fd used for receiving API associated events.
-/// * `from_api` - The receiver end point of the communication channel.
-/// * `seccomp_level` - The level of seccomp filtering used. Filters are loaded before executing
-///                     guest code. Can be one of 0 (seccomp disabled), 1 (filter by syscall
-///                     number) or 2 (filter by syscall number and argument values).
-/// * `kvm_fd` - Provides the option of supplying an already existing raw file descriptor
-///              associated with `/dev/kvm`.
-/// * `config_json` - Optional parameter that can be used to configure the guest machine without
-///                   using the API socket.
-pub fn start_vmm_thread(
-    api_shared_info: Arc<RwLock<InstanceInfo>>,
-    api_event_fd: EventFd,
-    from_api: Receiver<Box<VmmAction>>,
-    seccomp_level: u32,
-    config_json: Option<String>,
-) -> thread::JoinHandle<()> {
-    thread::Builder::new()
-        .name("fc_vmm".to_string())
-        .spawn(move || {
-            // If this fails, consider it fatal. Use expect().
-            let mut vmm = Vmm::new(
-                api_shared_info,
-                &api_event_fd,
-                from_api,
-                seccomp_level,
-                Kvm::new().expect("Error creating the Kvm object"),
-            )
-            .expect("Cannot create VMM");
-
-            if let Some(json) = config_json {
-                if let Err(e) = vmm.configure_from_json(json) {
-                    error!(
-                        "Setting configuration for VMM from one single json failed: {}",
-                        e
-                    );
-                    process::exit(i32::from(FC_EXIT_CODE_BAD_CONFIGURATION));
-                } else if let Err(e) = vmm.start_microvm() {
-                    error!(
-                        "Starting microvm that was configured from one single json failed: {}",
-                        e
-                    );
-                    process::exit(i32::from(FC_EXIT_CODE_UNEXPECTED_ERROR));
-                } else {
-                    info!("Successfully started microvm that was configured from one single json");
-                }
-            }
-
-            // The loop continues to run as long as there is no error. Whenever run_event_loop
-            // returns due to a ControlAction, we handle it and invoke `continue`. Clippy thinks
-            // this never loops and complains about it, but Clippy is wrong.
-            #[allow(clippy::never_loop)]
-            let exit_code = loop {
-                // `break <expression>` causes the outer loop to break and return the result
-                // of evaluating <expression>, which in this case is the exit code.
-                break match vmm.run_event_loop() {
-                    Ok(exit_reason) => match exit_reason {
-                        EventLoopExitReason::Break => {
-                            info!("Gracefully terminated VMM control loop");
-                            FC_EXIT_CODE_OK
-                        }
-                        EventLoopExitReason::ControlAction => {
-                            if let Err(e) = api_event_fd.read() {
-                                error!("Error reading VMM API event_fd {:?}", e);
-                                FC_EXIT_CODE_GENERIC_ERROR
-                            } else {
-                                vmm.run_vmm_action().unwrap_or_else(|_| {
-                                    warn!("Got a spurious notification from api thread");
-                                });
-                                continue;
-                            }
-                        }
-                    },
-                    Err(e) => {
-                        error!("Abruptly exited VMM control loop: {:?}", e);
-                        FC_EXIT_CODE_GENERIC_ERROR
-                    }
-                };
-            };
-
-            vmm.stop(i32::from(exit_code));
-        })
-        .expect("VMM thread spawn failed.")
-}
-
 #[cfg(test)]
 mod tests {
+    macro_rules! assert_match {
+        ($x:expr, $y:pat) => {{
+            if let $y = $x {
+                ()
+            } else {
+                panic!()
+            }
+        }};
+    }
+
     extern crate tempfile;
 
     use super::*;
@@ -2308,10 +2036,9 @@ mod tests {
         fn default_kernel_config(&mut self, cust_kernel_path: Option<PathBuf>) {
             let kernel_temp_file =
                 NamedTempFile::new().expect("Failed to create temporary kernel file.");
-            let kernel_path = if cust_kernel_path.is_some() {
-                cust_kernel_path.unwrap()
-            } else {
-                kernel_temp_file.path().to_path_buf()
+            let kernel_path = match cust_kernel_path {
+                Some(kernel_path) => kernel_path,
+                None => kernel_temp_file.path().to_path_buf(),
             };
             let kernel_file = File::open(kernel_path).expect("Cannot open kernel file");
             let mut cmdline = kernel_cmdline::Cmdline::new(arch::CMDLINE_MAX_SIZE);
@@ -2385,10 +2112,17 @@ mod tests {
             &[10]
         }
 
-        fn ack_features(&mut self, page: u32, value: u32) {
-            let _ = page;
-            let _ = value;
+        fn ack_features_by_page(&mut self, _: u32, _: u32) {}
+
+        fn avail_features(&self) -> u64 {
+            0
         }
+
+        fn acked_features(&self) -> u64 {
+            0
+        }
+
+        fn set_acked_features(&mut self, _: u64) {}
 
         fn read_config(&self, offset: u64, data: &mut [u8]) {
             let _ = offset;
@@ -2421,13 +2155,10 @@ mod tests {
             vmm_version: "1.0".to_string(),
         }));
 
-        let (_to_vmm, from_api) = channel();
         Vmm::new(
             shared_info,
             &EventFd::new().expect("Cannot create eventFD"),
-            from_api,
             seccomp::SECCOMP_LEVEL_NONE,
-            Kvm::new().expect("Error creating Kvm object"),
         )
         .expect("Cannot Create VMM")
     }
@@ -2541,7 +2272,6 @@ mod tests {
             rx_rate_limiter: None,
             tx_rate_limiter: None,
             allow_mmds_requests: false,
-            tap: None,
         };
         assert!(vmm.insert_net_device(network_interface).is_ok());
 
@@ -2554,7 +2284,6 @@ mod tests {
             rx_rate_limiter: None,
             tx_rate_limiter: None,
             allow_mmds_requests: false,
-            tap: None,
         };
         assert!(vmm.insert_net_device(network_interface).is_ok());
 
@@ -2566,7 +2295,6 @@ mod tests {
             rx_rate_limiter: None,
             tx_rate_limiter: None,
             allow_mmds_requests: false,
-            tap: None,
         };
         assert!(vmm.insert_net_device(network_interface).is_err());
 
@@ -2579,7 +2307,6 @@ mod tests {
             rx_rate_limiter: None,
             tx_rate_limiter: None,
             allow_mmds_requests: false,
-            tap: None,
         };
         assert!(vmm.insert_net_device(network_interface).is_err());
     }
@@ -2609,7 +2336,6 @@ mod tests {
             }),
             tx_rate_limiter: None,
             allow_mmds_requests: false,
-            tap: None,
         })
         .unwrap();
 
@@ -2888,14 +2614,24 @@ mod tests {
         let vmm = create_vmm_object(InstanceState::Starting);
         assert_eq!(vmm.is_instance_initialized(), true);
 
-        let vmm = create_vmm_object(InstanceState::Halting);
-        assert_eq!(vmm.is_instance_initialized(), true);
-
-        let vmm = create_vmm_object(InstanceState::Halted);
-        assert_eq!(vmm.is_instance_initialized(), true);
-
         let vmm = create_vmm_object(InstanceState::Running);
         assert_eq!(vmm.is_instance_initialized(), true);
+    }
+
+    #[test]
+    fn test_epoll_stdin_event() {
+        let mut epoll_context = EpollContext::new().unwrap();
+        epoll_context.enable_stdin_event();
+        assert_eq!(
+            epoll_context.dispatch_table[epoll_context.stdin_index as usize].unwrap(),
+            EpollDispatch::Stdin
+        );
+        // This should trigger a warn!. When logger will not be a global var we will be able to test
+        // it.
+        epoll_context.enable_stdin_event();
+
+        epoll_context.disable_stdin_event();
+        assert!(epoll_context.dispatch_table[epoll_context.stdin_index as usize].is_none());
     }
 
     #[test]
@@ -3036,7 +2772,6 @@ mod tests {
             rx_rate_limiter: None,
             tx_rate_limiter: None,
             allow_mmds_requests: false,
-            tap: None,
         };
 
         assert!(vmm.insert_net_device(network_interface).is_ok());
@@ -3091,9 +2826,6 @@ mod tests {
     }
 
     #[test]
-    // Allow assertions on constants is necessary because we cannot implement
-    // PartialEq on VmmActionError.
-    #[allow(clippy::assertions_on_constants)]
     fn test_block_device_rescan() {
         let mut vmm = create_vmm_object(InstanceState::Uninitialized);
         vmm.default_kernel_config(None);
@@ -3160,52 +2892,61 @@ mod tests {
         // Test rescan block device with invalid path.
         let prev_path = non_root_block_device.path_on_host().clone();
         vmm.update_block_device_path(&scratch_id, PathBuf::from("foo"));
-        match vmm.rescan_block_device(&scratch_id) {
+        assert_match!(
+            vmm.rescan_block_device(&scratch_id),
             Err(VmmActionError::DriveConfig(
                 ErrorKind::User,
                 DriveError::BlockDeviceUpdateFailed,
-            )) => (),
-            _ => assert!(false),
-        }
+            ))
+        );
         vmm.update_block_device_path(&scratch_id, prev_path);
 
         // Test rescan_block_device with invalid ID.
-        match vmm.rescan_block_device(&"foo".to_string()) {
-            Err(VmmActionError::DriveConfig(ErrorKind::User, DriveError::InvalidBlockDeviceID)) => {
-            }
-            _ => assert!(false),
-        }
+        assert_match!(
+            vmm.rescan_block_device(&"foo".to_string()),
+            Err(VmmActionError::DriveConfig(
+                ErrorKind::User,
+                DriveError::InvalidBlockDeviceID
+            ))
+        );
+
         vmm.change_id(&scratch_id, "scratch");
-        match vmm.rescan_block_device(&scratch_id) {
-            Err(VmmActionError::DriveConfig(ErrorKind::User, DriveError::InvalidBlockDeviceID)) => {
-            }
-            _ => assert!(false),
-        }
+        assert_match!(
+            vmm.rescan_block_device(&scratch_id),
+            Err(VmmActionError::DriveConfig(
+                ErrorKind::User,
+                DriveError::InvalidBlockDeviceID
+            ))
+        );
 
         // Test rescan_block_device with invalid device address.
         vmm.remove_device_info(TYPE_BLOCK, &scratch_id);
-        match vmm.rescan_block_device(&scratch_id) {
-            Err(VmmActionError::DriveConfig(ErrorKind::User, DriveError::InvalidBlockDeviceID)) => {
-            }
-            _ => assert!(false),
-        }
+
+        assert_match!(
+            vmm.rescan_block_device(&scratch_id),
+            Err(VmmActionError::DriveConfig(
+                ErrorKind::User,
+                DriveError::InvalidBlockDeviceID
+            ))
+        );
 
         // Test rescan not allowed.
         let mut vmm = create_vmm_object(InstanceState::Uninitialized);
         assert!(vmm
             .insert_block_device(non_root_block_device.clone())
             .is_ok());
-        match vmm.rescan_block_device(&scratch_id) {
+
+        assert_match!(
+            vmm.rescan_block_device(&scratch_id),
             Err(VmmActionError::DriveConfig(
                 ErrorKind::User,
                 DriveError::OperationNotAllowedPreBoot,
-            )) => (),
-            _ => assert!(false),
-        }
+            ))
+        );
     }
 
     #[test]
-    fn test_init_logger_from_api() {
+    fn test_init_logger() {
         // Error case: update after instance is running
         let log_file = NamedTempFile::new().unwrap();
         let metrics_file = NamedTempFile::new().unwrap();
@@ -3225,11 +2966,23 @@ mod tests {
         // Reset vmm state to test the other scenarios.
         vmm.set_instance_state(InstanceState::Uninitialized);
 
-        // Error case: initializing logger with invalid pipes returns error.
+        // Error case: initializing logger with invalid log pipe returns error.
         let desc = LoggerConfig {
             log_fifo: String::from("not_found_file_log"),
+            metrics_fifo: metrics_file.path().to_str().unwrap().to_string(),
+            level: LoggerLevel::Debug,
+            show_level: false,
+            show_log_origin: false,
+            #[cfg(target_arch = "x86_64")]
+            options: Value::Array(vec![]),
+        };
+        assert!(vmm.init_logger(desc).is_err());
+
+        // Error case: initializing logger with invalid metrics pipe returns error.
+        let desc = LoggerConfig {
+            log_fifo: log_file.path().to_str().unwrap().to_string(),
             metrics_fifo: String::from("not_found_file_metrics"),
-            level: LoggerLevel::Warning,
+            level: LoggerLevel::Debug,
             show_level: false,
             show_log_origin: false,
             #[cfg(target_arch = "x86_64")]
@@ -3261,15 +3014,11 @@ mod tests {
             #[cfg(target_arch = "x86_64")]
             options: Value::Array(vec![Value::String("LogDirtyPages".to_string())]),
         };
-        // Flushing metrics before initializing logger is erroneous.
-        let err = vmm.flush_metrics();
-        assert!(err.is_err());
-        assert_eq!(
-            format!("{:?}", err.unwrap_err()),
-            "Logger(Internal, FlushMetrics(\"Logger was not initialized.\"))"
-        );
+        // Flushing metrics before initializing logger is not erroneous.
+        assert!(vmm.flush_metrics().is_ok());
 
-        assert!(vmm.init_logger(desc).is_ok());
+        assert!(vmm.init_logger(desc.clone()).is_ok());
+        assert!(vmm.init_logger(desc).is_err());
 
         assert!(vmm.flush_metrics().is_ok());
 
@@ -3418,7 +3167,6 @@ mod tests {
             rx_rate_limiter: None,
             tx_rate_limiter: None,
             allow_mmds_requests: false,
-            tap: None,
         };
 
         assert!(vmm.insert_net_device(network_interface).is_ok());
@@ -3850,8 +3598,8 @@ mod tests {
                 ErrorKind::Internal
             );
             assert_eq!(
-                error_kind(NetworkInterfaceError::OpenTap(TapError::NetUtil(
-                    net_util::Error::CreateSocket(io::Error::from_raw_os_error(0))
+                error_kind(NetworkInterfaceError::OpenTap(TapError::CreateSocket(
+                    io::Error::from_raw_os_error(0)
                 ))),
                 ErrorKind::Internal
             );
@@ -3910,8 +3658,16 @@ mod tests {
             ErrorKind::Internal
         );
         assert_eq!(
-            error_kind(StartMicrovmError::CreateVsockDevice),
+            error_kind(StartMicrovmError::CreateVsockBackend(
+                devices::virtio::vsock::VsockUnixBackendError::InvalidPortRequest
+            )),
             ErrorKind::User
+        );
+        assert_eq!(
+            error_kind(StartMicrovmError::CreateVsockDevice(
+                devices::virtio::vsock::VsockError::NoData
+            )),
+            ErrorKind::Internal
         );
         assert_eq!(
             error_kind(StartMicrovmError::DeviceManager),
@@ -4042,10 +3798,6 @@ mod tests {
         // Enum `Error`
 
         assert_eq!(
-            format!("{:?}", Error::ApiChannel),
-            "ApiChannel: error receiving data from the API server"
-        );
-        assert_eq!(
             format!(
                 "{:?}",
                 Error::CreateLegacyDevice(device_manager::legacy::Error::EventFd(
@@ -4128,6 +3880,38 @@ mod tests {
                 )
             ),
             "DriveConfig(User, BlockDevicePathAlreadyExists)"
+        );
+        assert_eq!(
+            format!(
+                "{}",
+                VmmActionError::Logger(
+                    ErrorKind::User,
+                    LoggerConfigError::FlushMetrics(String::from("Failed to flush metrics"))
+                )
+            ),
+            "Failed to flush metrics"
+        );
+        assert_eq!(
+            format!(
+                "{:?}",
+                VmmActionError::Logger(
+                    ErrorKind::User,
+                    LoggerConfigError::FlushMetrics(String::from("foobar"))
+                )
+            ),
+            "Logger(User, FlushMetrics(\"foobar\"))"
+        );
+        assert_eq!(
+            format!(
+                "{}",
+                VmmActionError::Logger(
+                    ErrorKind::User,
+                    LoggerConfigError::InitializationFailure(String::from(
+                        "Failed to initialize logger"
+                    ))
+                )
+            ),
+            "Failed to initialize logger"
         );
         assert_eq!(
             format!(
